@@ -21,55 +21,88 @@ type LogPayload struct {
 }
 
 func main() {
-	// CLI Flags for configuration
 	targetURL := flag.String("url", "https://localhost:443/ingest", "The secure-logger ingest URL")
-	serviceName := flag.String("service", "cli-pipe", "The service name to tag these logs with")
+	serviceName := flag.String("service", "slog-pipe", "The service name to tag these logs with")
 	flag.Parse()
 
-	// Configure HTTP client to ignore the self-signed/ephemeral certs from secure_network
+	// Configure HTTP client to ignore self-signed certificates on local ingestion
 	client := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
-		Timeout: 5 * time.Second, // Prevent hanging on dead network
+		Timeout: 5 * time.Second,
 	}
 
-	// Read continuously from standard input
 	scanner := bufio.NewScanner(os.Stdin)
-	
-	fmt.Printf("📡 Listening on stdin and forwarding to %s (Service: %s)...\n", *targetURL, *serviceName)
+	fmt.Printf("📡 Listening for slog JSON on stdin and forwarding to %s...\n", *targetURL)
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		
-		// Skip empty lines
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 
-		// Basic heuristic to detect log severity from the raw text
-		level := "INFO"
-		upperLine := strings.ToUpper(line)
-		if strings.Contains(upperLine, "ERROR") || strings.Contains(upperLine, "FAIL") || strings.Contains(upperLine, "PANIC") {
-			level = "ERROR"
-		} else if strings.Contains(upperLine, "WARN") {
-			level = "WARN"
+		var payload LogPayload
+		var rawJSON map[string]interface{}
+
+		// 1. Attempt to parse the line as a JSON object (slog default behavior)
+		if err := json.Unmarshal([]byte(line), &rawJSON); err == nil {
+			
+			// Extract standard slog fields (they default to lowercase keys)
+			level := "INFO"
+			if lvl, ok := rawJSON["level"].(string); ok {
+				level = strings.ToUpper(lvl)
+			}
+
+			msg := ""
+			if m, ok := rawJSON["msg"].(string); ok {
+				msg = m
+			} else if m, ok := rawJSON["message"].(string); ok {
+				msg = m
+			}
+
+			// Clean up extracted keys so we can format the remaining custom slog attributes
+			delete(rawJSON, "level")
+			delete(rawJSON, "msg")
+			delete(rawJSON, "message")
+			delete(rawJSON, "time") // Optional: remove timestamp if your dashboard tracks receipt time
+
+			// Format remaining attributes (like custom fields added via slog.String("user", "admin"))
+			extraData, _ := json.Marshal(rawJSON)
+			if string(extraData) != "{}" {
+				msg = fmt.Sprintf("%s | Attributes: %s", msg, string(extraData))
+			}
+
+			payload = LogPayload{
+				Level:   level,
+				Service: *serviceName,
+				Message: msg,
+			}
+
+		} else {
+			// 2. Fallback: Not JSON, parse as raw terminal text
+			level := "INFO"
+			upperLine := strings.ToUpper(line)
+			if strings.Contains(upperLine, "ERROR") || strings.Contains(upperLine, "FAIL") || strings.Contains(upperLine, "PANIC") {
+				level = "ERROR"
+			} else if strings.Contains(upperLine, "WARN") {
+				level = "WARN"
+			}
+
+			payload = LogPayload{
+				Level:   level,
+				Service: *serviceName,
+				Message: line,
+			}
 		}
 
-		// Construct the JSON payload
-		payload := LogPayload{
-			Level:   level,
-			Service: *serviceName,
-			Message: line,
-		}
-
+		// Ship to secure_network
 		jsonData, err := json.Marshal(payload)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to encode JSON: %v\n", err)
 			continue
 		}
 
-		// Fire off the HTTP POST to the ingest node
 		resp, err := client.Post(*targetURL, "application/json", bytes.NewBuffer(jsonData))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to send log to %s: %v\n", *targetURL, err)
