@@ -13,7 +13,6 @@ import (
 	"time"
 )
 
-// LogPayload matches the structure expected by your secure-logger backend
 type LogPayload struct {
 	Level   string `json:"level"`
 	Service string `json:"service"`
@@ -25,7 +24,6 @@ func main() {
 	serviceName := flag.String("service", "slog-pipe", "The service name to tag these logs with")
 	flag.Parse()
 
-	// Configure HTTP client to ignore self-signed certificates on local ingestion
 	client := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -33,90 +31,52 @@ func main() {
 		Timeout: 5 * time.Second,
 	}
 
+	// Check if stdin is actually receiving piped data
+	stat, _ := os.Stdin.Stat()
+	if (stat.Mode() & os.ModeCharDevice) != 0 {
+		fmt.Println("⚠️  WARNING: No pipe detected. (Did you use the '|' operator?) Type manually and press Enter:")
+	} else {
+		fmt.Printf("📡 Connected to pipe. Forwarding to %s...\n", *targetURL)
+	}
+
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Printf("📡 Listening for slog JSON on stdin and forwarding to %s...\n", *targetURL)
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		fmt.Printf("\n[DEBUG-1] Read line from stdin: %s\n", line)
+
 		if strings.TrimSpace(line) == "" {
+			fmt.Println("[DEBUG-2] Line was empty, skipping.")
 			continue
 		}
 
-		var payload LogPayload
-		var rawJSON map[string]interface{}
-
-		// 1. Attempt to parse the line as a JSON object (slog default behavior)
-		if err := json.Unmarshal([]byte(line), &rawJSON); err == nil {
-			
-			// Extract standard slog fields (they default to lowercase keys)
-			level := "INFO"
-			if lvl, ok := rawJSON["level"].(string); ok {
-				level = strings.ToUpper(lvl)
-			}
-
-			msg := ""
-			if m, ok := rawJSON["msg"].(string); ok {
-				msg = m
-			} else if m, ok := rawJSON["message"].(string); ok {
-				msg = m
-			}
-
-			// Clean up extracted keys so we can format the remaining custom slog attributes
-			delete(rawJSON, "level")
-			delete(rawJSON, "msg")
-			delete(rawJSON, "message")
-			delete(rawJSON, "time") // Optional: remove timestamp if your dashboard tracks receipt time
-
-			// Format remaining attributes (like custom fields added via slog.String("user", "admin"))
-			extraData, _ := json.Marshal(rawJSON)
-			if string(extraData) != "{}" {
-				msg = fmt.Sprintf("%s | Attributes: %s", msg, string(extraData))
-			}
-
-			payload = LogPayload{
-				Level:   level,
-				Service: *serviceName,
-				Message: msg,
-			}
-
-		} else {
-			// 2. Fallback: Not JSON, parse as raw terminal text
-			level := "INFO"
-			upperLine := strings.ToUpper(line)
-			if strings.Contains(upperLine, "ERROR") || strings.Contains(upperLine, "FAIL") || strings.Contains(upperLine, "PANIC") {
-				level = "ERROR"
-			} else if strings.Contains(upperLine, "WARN") {
-				level = "WARN"
-			}
-
-			payload = LogPayload{
-				Level:   level,
-				Service: *serviceName,
-				Message: line,
-			}
+		payload := LogPayload{
+			Level:   "INFO",
+			Service: *serviceName,
+			Message: line,
 		}
 
-		// Ship to secure_network
 		jsonData, err := json.Marshal(payload)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Failed to encode JSON: %v\n", err)
+			fmt.Printf("❌ [DEBUG-3] JSON Encode failed: %v\n", err)
 			continue
 		}
+		fmt.Printf("[DEBUG-3] Generated JSON Payload: %s\n", string(jsonData))
 
+		fmt.Println("[DEBUG-4] Firing HTTP POST to server...")
 		resp, err := client.Post(*targetURL, "application/json", bytes.NewBuffer(jsonData))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Failed to send log to %s: %v\n", *targetURL, err)
+			fmt.Printf("❌ [DEBUG-5] NETWORK ERROR: %v\n", err)
 			continue
 		}
 		
-		if resp.StatusCode != http.StatusOK {
-			fmt.Fprintf(os.Stderr, "⚠️ Server rejected log, status: %s\n", resp.Status)
-		}
-		
+		fmt.Printf("[DEBUG-5] Server responded with Status: %d %s\n", resp.StatusCode, resp.Status)
 		resp.Body.Close()
 	}
 
 	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "Fatal error reading stdin: %v\n", err)
+		fmt.Printf("❌ Fatal scanner error: %v\n", err)
 	}
+	
+	fmt.Println("[DEBUG-6] Scanner closed/EOF reached. Exiting.")
 }
