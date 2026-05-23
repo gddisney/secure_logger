@@ -80,51 +80,60 @@ func recordInternalLog(db *ultimate_db.DB, logPageID ultimate_db.PageID, searchE
 func formatBooleanQuery(q string) string {
 	upper := strings.ToUpper(q)
 	if strings.Contains(upper, " AND ") || strings.Contains(upper, " OR ") || strings.Contains(upper, " NOT ") {
-		return q // The user is utilizing explicit AST logic, pass it through directly.
+		return q 
 	}
 	
-	// Fallback for natural language searches: convert "error auth service" into "error AND auth AND service"
 	tokens := strings.Fields(q)
 	return strings.Join(tokens, " AND ")
 }
 
 func main() {
-	disk, err := ultimate_db.NewDiskManager("logs.db")
-	if err != nil { log.Fatalf("Failed to open logs.db: %v", err) }
-	pool := ultimate_db.NewBufferPool(disk, 2048)
-	wal, err := ultimate_db.NewBatchingWAL("logs.wal")
-	if err != nil { log.Fatalf("Failed to open logs.wal: %v", err) }
-	
-	db := ultimate_db.NewDB(pool, wal)
-	defer db.Close()
+	// 1. Initialize the UI Framework
+	ui, err := guikit.New("ui.db", "ui.wal")
+	if err != nil { log.Fatalf("Failed to boot guikit: %v", err) }
+
+	authProvider, err := webauthnext.New(ui, "LogOps Console", "localhost", "https://localhost")
+	if err != nil { log.Fatalf("Failed to boot webauthnext: %v", err) }
+
+	// 2. Boot Search Engine (this automatically initializes the DB and secure_network.EdgeNode)
+	searchEngine, err := orchid_sync.NewEngine("logs.db", 443, authProvider)
+	if err != nil { log.Fatalf("Failed to boot search engine: %v", err) }
+
+	// 3. Extract encapsulated EdgeNode infrastructure
+	edgeNode := searchEngine.NetNode()
+	db := edgeNode.DB
+	r := edgeNode.Router
 	logPageID := ultimate_db.PageID(1)
 
-	// --- MESH INITIALIZATION ---
+	// Attach UI to the EdgeNode's Router
+	r.GUIKit = ui
+	r.Mux.Handle("/", ui.Mux)
+
+	// 4. Mesh Initialization for Outbound Tunnel
 	gatewayPubKey := []byte("central-gateway-static-pubkey-32b") 
 	gatewayAddress := "gateway.mesh.internal:443"
 
 	meshNode, err := secure_network.NewMeshNode(db, gatewayPubKey)
 	if err != nil { log.Fatalf("Mesh Node hardware identity instantiation failed: %v", err) }
 
-	ui, err := guikit.New("ui.db", "ui.wal")
-	if err != nil { log.Fatalf("Failed to boot guikit: %v", err) }
-
-	r, err := secure_network.NewRouter(db, ui, "secure_session_token")
-	if err != nil { log.Fatalf("Kernel initialization failed: %v", err) }
-	r.Port = "443"
-
-	authProvider, err := webauthnext.New(ui, "LogOps Console", "localhost", "https://localhost")
-	if err != nil { log.Fatalf("Failed to boot webauthnext: %v", err) }
-
-	searchEngine, err := orchid_sync.NewEngine("logs_index.db", 9999, authProvider)
-	if err != nil { log.Fatalf("Failed to boot search engine: %v", err) }
-
 	// --- BOOTSTRAP IDENTITY & INJECT MESH ---
 	secure_bootstrap.BootstrapAuth(r, authProvider, meshNode, gatewayAddress)
 
-	// --- RUN MESH TASK CONSUMER ---
-	go meshTaskConsumerWorker(db)
+	// 5. Replace DB polling loop with Event-Driven RPC Manager
+	rpcEngine := r.Modules["mesh_rpc"].(*secure_network.RPCManager)
+	rpcEngine.Register("ingest_log", func(ctx secure_network.RPCContext, args []byte) (interface{}, error) {
+		var logData LogPayload
+		if err := json.Unmarshal(args, &logData); err != nil {
+			return nil, err
+		}
+		
+		recordInternalLog(db, logPageID, searchEngine, logData.Level, logData.Service, logData.Message)
+		log.Printf("[RPC] Processed log ingestion from peer: %x", ctx.CallerID[:8])
+		
+		return map[string]string{"status": "success"}, nil
+	})
 
+	// --- SETUP UI ROUTES ---
 	ui.Get("/logout", func(c *guikit.Context) {
 		http.SetCookie(c.W, &http.Cookie{Name: "session_id", MaxAge: -1, Path: "/"})
 		http.Redirect(c.W, c.R, "/auth", http.StatusSeeOther)
@@ -141,12 +150,9 @@ func main() {
 		var searchResults []LogDisplay
 
 		if query != "" {
-			// Format the query to ensure AST compatibility
 			formattedQuery := formatBooleanQuery(query)
-			
 			hits, err := searchEngine.Search(formattedQuery, 50)
 			
-			// Catch AST Parsing Errors (e.g., missing closing parenthesis)
 			if err != nil {
 				searchError = "Invalid query syntax: " + err.Error()
 			} else {
@@ -183,7 +189,7 @@ func main() {
 
 		c.Data["Query"] = query
 		c.Data["Results"] = searchResults
-		c.Data["SearchError"] = searchError // Pass error out to GML so the UI can display it
+		c.Data["SearchError"] = searchError 
 		ui.Render(c, "views/index") 
 	}))
 
@@ -202,13 +208,9 @@ func main() {
 		w.Write([]byte("Log ingested successfully"))
 	})
 
-	log.Println("Booting Zero-Trust Ingress Router on :443")
-	r.Boot()
-}
-
-func meshTaskConsumerWorker(db *ultimate_db.DB) {
-	log.Println("[WORKER] Active and monitoring ultimate_db Page 100 for incoming mesh directives...")
-	for {
-		time.Sleep(1 * time.Second)
+	log.Println("Booting Zero-Trust Ingress Edge Node on :443")
+	// Launch the unified Edge Node (which triggers the kernel Boot protocol and listeners)
+	if err := edgeNode.Start("443", r.TLSConfig); err != nil {
+		log.Fatalf("Edge Node crashed: %v", err)
 	}
 }
