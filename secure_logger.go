@@ -75,6 +75,19 @@ func recordInternalLog(db *ultimate_db.DB, logPageID ultimate_db.PageID, searchE
 	log.Printf("[INTERNAL] 📝 %s %s: %s", level, service, message)
 }
 
+// formatBooleanQuery ensures that standard space-separated words are treated as an AND query
+// if the user didn't explicitly use the new AST boolean operators.
+func formatBooleanQuery(q string) string {
+	upper := strings.ToUpper(q)
+	if strings.Contains(upper, " AND ") || strings.Contains(upper, " OR ") || strings.Contains(upper, " NOT ") {
+		return q // The user is utilizing explicit AST logic, pass it through directly.
+	}
+	
+	// Fallback for natural language searches: convert "error auth service" into "error AND auth AND service"
+	tokens := strings.Fields(q)
+	return strings.Join(tokens, " AND ")
+}
+
 func main() {
 	disk, err := ultimate_db.NewDiskManager("logs.db")
 	if err != nil { log.Fatalf("Failed to open logs.db: %v", err) }
@@ -87,7 +100,6 @@ func main() {
 	logPageID := ultimate_db.PageID(1)
 
 	// --- MESH INITIALIZATION ---
-	// Using a dummy 32-byte key. Replace this with your actual central gateway public key.
 	gatewayPubKey := []byte("central-gateway-static-pubkey-32b") 
 	gatewayAddress := "gateway.mesh.internal:443"
 
@@ -120,6 +132,8 @@ func main() {
 
 	ui.Get("/", secure_bootstrap.RequireAuth(r, func(c *guikit.Context) {
 		var query string
+		var searchError string
+
 		if c.R != nil {
 			query = strings.TrimSpace(c.R.URL.Query().Get("q"))
 		}
@@ -127,8 +141,15 @@ func main() {
 		var searchResults []LogDisplay
 
 		if query != "" {
-			hits, err := searchEngine.Search(query, 50)
-			if err == nil {
+			// Format the query to ensure AST compatibility
+			formattedQuery := formatBooleanQuery(query)
+			
+			hits, err := searchEngine.Search(formattedQuery, 50)
+			
+			// Catch AST Parsing Errors (e.g., missing closing parenthesis)
+			if err != nil {
+				searchError = "Invalid query syntax: " + err.Error()
+			} else {
 				readTxn := db.BeginTxn()
 				for _, hit := range hits {
 					rawLog, err := db.ReadCompressed(logPageID, readTxn, []byte(hit.DocID))
@@ -137,7 +158,11 @@ func main() {
 					var parsedLog LogPayload
 					if err := json.Unmarshal(rawLog, &parsedLog); err == nil {
 						levelClass := "level-info"
-						if parsedLog.Level == "ERROR" || parsedLog.Level == "FATAL" { levelClass = "level-error" } else if parsedLog.Level == "WARN" { levelClass = "level-warn" }
+						if parsedLog.Level == "ERROR" || parsedLog.Level == "FATAL" { 
+							levelClass = "level-error" 
+						} else if parsedLog.Level == "WARN" { 
+							levelClass = "level-warn" 
+						}
 
 						searchResults = append(searchResults, LogDisplay{
 							LevelClass: levelClass,
@@ -148,7 +173,7 @@ func main() {
 						})
 					}
 				}
-				db.CommitTxn(readTxn) // Release the read lock
+				db.CommitTxn(readTxn)
 			}
 		} else {
 			logsMu.RLock()
@@ -158,6 +183,7 @@ func main() {
 
 		c.Data["Query"] = query
 		c.Data["Results"] = searchResults
+		c.Data["SearchError"] = searchError // Pass error out to GML so the UI can display it
 		ui.Render(c, "views/index") 
 	}))
 
@@ -180,12 +206,9 @@ func main() {
 	r.Boot()
 }
 
-// meshTaskConsumerWorker executes inbound commands written to TaskPageID (100) by the mesh listener loop
 func meshTaskConsumerWorker(db *ultimate_db.DB) {
 	log.Println("[WORKER] Active and monitoring ultimate_db Page 100 for incoming mesh directives...")
 	for {
-		// Poll or wait on your database layer for new keys written to TaskPageID
-		// In a real implementation, read from Page 100, execute the JSON action, and delete the key.
 		time.Sleep(1 * time.Second)
 	}
 }
