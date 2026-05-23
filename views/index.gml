@@ -32,13 +32,18 @@ wrapper("views/layout.gml",
         button.search-btn:type."submit"("Search Engine")
     ),
 
-    // Log Render Output
-    div.log-container.font-mono(
-        
+    // AST Parse Error Banner
+    "{{ if .SearchError }}",
+        div:style."padding: 12px; background: rgba(248,81,73,0.1); color: #ff7b72; border-bottom: 1px solid rgba(248,81,73,0.4); text-align: center; font-size: 13px;"(
+            "{{ .SearchError }}"
+        ),
+    "{{ end }}",
+
+    // Log Render Output - Note the added ID for JS targeting
+    div.log-container.font-mono:id."log-stream"(
         "{{ if .Results }}",
             "{{ range .Results }}",
             div.log-row(
-                // Expecting a Go struct like: { Level: "ERROR", LevelClass: "level-error", Time: "2026-05-22 09:41", Service: "auth-svc", Message: "..." }
                 div:class."log-level {{ .LevelClass }}"("{{ .Level }}"),
                 div.log-time("{{ .Time }}"),
                 div.log-service("{{ .Service }}"),
@@ -51,5 +56,50 @@ wrapper("views/layout.gml",
                 span("Awaiting query or no matching telemetry found.")
             ),
         "{{ end }}"
-    )
+    ),
+
+    // Real-Time WebSocket Injection
+    script(`
+        document.addEventListener("DOMContentLoaded", () => {
+            setTimeout(() => {
+                if (!window.gk || !window.gk.ws) return;
+                
+                window.gk.ws.addEventListener("message", (e) => {
+                    const data = JSON.parse(e.data);
+                    
+                    if (data.event === "new_log") {
+                        // Pause the live tail if the user is actively viewing search results
+                        const urlParams = new URLSearchParams(window.location.search);
+                        if (urlParams.get("q")) return; 
+
+                        const logData = data.payload;
+                        const container = document.getElementById("log-stream");
+                        
+                        if (container) {
+                            // Clear the "📭 Awaiting query..." placeholder if it exists
+                            if (container.innerHTML.includes("Awaiting query")) {
+                                container.innerHTML = "";
+                            }
+
+                            const row = document.createElement("div");
+                            row.className = "log-row";
+                            row.innerHTML = `
+                                <div class="log-level ${logData.LevelClass}">${logData.Level}</div>
+                                <div class="log-time">${logData.Time}</div>
+                                <div class="log-service">${logData.Service}</div>
+                                <div class="log-message">${logData.Message}</div>
+                            `;
+                            
+                            container.prepend(row);
+                            
+                            // Prevent DOM memory leaks
+                            if (container.children.length > 100) {
+                                container.removeChild(container.lastChild);
+                            }
+                        }
+                    }
+                });
+            }, 100);
+        });
+    `)
 )
