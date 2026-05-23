@@ -44,39 +44,49 @@ func generateID() string {
 	return hex.EncodeToString(bytes)
 }
 
-func recordInternalLog(db *ultimate_db.DB, logPageID ultimate_db.PageID, searchEngine *orchid_sync.Engine, level, service, message string) {
+// Added the *guikit.GUIKit parameter here to enable WebSocket broadcasts
+func recordInternalLog(db *ultimate_db.DB, ui *guikit.GUIKit, logPageID ultimate_db.PageID, searchEngine *orchid_sync.Engine, level, service, message string) {
 	logID := generateID()
 	logData := LogPayload{Level: level, Service: service, Message: message}
 	payload, _ := json.Marshal(logData)
 
 	txnID := db.BeginTxn()
 	_ = db.WriteCompressed(logPageID, txnID, []byte(logID), payload, 720*time.Hour)
-	db.CommitTxn(txnID) // Data now permanently saves to disk
+	db.CommitTxn(txnID)
 
 	indexableText := strings.ToLower(level + " " + service + " " + message)
 	_ = searchEngine.Index(logID, indexableText)
 	
 	levelClass := "level-info"
-	if level == "ERROR" || level == "FATAL" { levelClass = "level-error" } else if level == "WARN" { levelClass = "level-warn" }
+	if level == "ERROR" || level == "FATAL" { 
+		levelClass = "level-error" 
+	} else if level == "WARN" { 
+		levelClass = "level-warn" 
+	}
 
-	logsMu.Lock()
-	recentLogs = append([]LogDisplay{{
+	newLog := LogDisplay{
 		LevelClass: levelClass,
 		Level:      level,
 		Time:       time.Now().Format("15:04:05"), 
 		Service:    service,
 		Message:    message,
-	}}, recentLogs...)
+	}
+
+	logsMu.Lock()
+	recentLogs = append([]LogDisplay{newLog}, recentLogs...)
 	if len(recentLogs) > 100 {
 		recentLogs = recentLogs[:100]
 	}
 	logsMu.Unlock()
 
+	// Broadcast the newly created log directly to all connected WebSockets
+	if ui != nil {
+		ui.Broadcast("new_log", newLog)
+	}
+
 	log.Printf("[INTERNAL] 📝 %s %s: %s", level, service, message)
 }
 
-// formatBooleanQuery ensures that standard space-separated words are treated as an AND query
-// if the user didn't explicitly use the new AST boolean operators.
 func formatBooleanQuery(q string) string {
 	upper := strings.ToUpper(q)
 	if strings.Contains(upper, " AND ") || strings.Contains(upper, " OR ") || strings.Contains(upper, " NOT ") {
@@ -88,38 +98,31 @@ func formatBooleanQuery(q string) string {
 }
 
 func main() {
-	// 1. Initialize the UI Framework
 	ui, err := guikit.New("ui.db", "ui.wal")
 	if err != nil { log.Fatalf("Failed to boot guikit: %v", err) }
 
 	authProvider, err := webauthnext.New(ui, "LogOps Console", "localhost", "https://localhost")
 	if err != nil { log.Fatalf("Failed to boot webauthnext: %v", err) }
 
-	// 2. Boot Search Engine (this automatically initializes the DB and secure_network.EdgeNode)
 	searchEngine, err := orchid_sync.NewEngine("logs.db", 443, authProvider)
 	if err != nil { log.Fatalf("Failed to boot search engine: %v", err) }
 
-	// 3. Extract encapsulated EdgeNode infrastructure
 	edgeNode := searchEngine.NetNode()
 	db := edgeNode.DB
 	r := edgeNode.Router
 	logPageID := ultimate_db.PageID(1)
 
-	// Attach UI to the EdgeNode's Router
 	r.GUIKit = ui
 	r.Mux.Handle("/", ui.Mux)
 
-	// 4. Mesh Initialization for Outbound Tunnel
 	gatewayPubKey := []byte("central-gateway-static-pubkey-32b") 
 	gatewayAddress := "gateway.mesh.internal:443"
 
 	meshNode, err := secure_network.NewMeshNode(db, gatewayPubKey)
 	if err != nil { log.Fatalf("Mesh Node hardware identity instantiation failed: %v", err) }
 
-	// --- BOOTSTRAP IDENTITY & INJECT MESH ---
 	secure_bootstrap.BootstrapAuth(r, authProvider, meshNode, gatewayAddress)
 
-	// 5. Replace DB polling loop with Event-Driven RPC Manager
 	rpcEngine := r.Modules["mesh_rpc"].(*secure_network.RPCManager)
 	rpcEngine.Register("ingest_log", func(ctx secure_network.RPCContext, args []byte) (interface{}, error) {
 		var logData LogPayload
@@ -127,13 +130,13 @@ func main() {
 			return nil, err
 		}
 		
-		recordInternalLog(db, logPageID, searchEngine, logData.Level, logData.Service, logData.Message)
+		// Pass 'ui' into the record function
+		recordInternalLog(db, ui, logPageID, searchEngine, logData.Level, logData.Service, logData.Message)
 		log.Printf("[RPC] Processed log ingestion from peer: %x", ctx.CallerID[:8])
 		
 		return map[string]string{"status": "success"}, nil
 	})
 
-	// --- SETUP UI ROUTES ---
 	ui.Get("/logout", func(c *guikit.Context) {
 		http.SetCookie(c.W, &http.Cookie{Name: "session_id", MaxAge: -1, Path: "/"})
 		http.Redirect(c.W, c.R, "/auth", http.StatusSeeOther)
@@ -201,7 +204,8 @@ func main() {
 
 		var logData LogPayload
 		if err := json.Unmarshal(payload, &logData); err == nil {
-			recordInternalLog(db, logPageID, searchEngine, logData.Level, logData.Service, logData.Message)
+			// Pass 'ui' into the record function
+			recordInternalLog(db, ui, logPageID, searchEngine, logData.Level, logData.Service, logData.Message)
 		}
 		
 		w.WriteHeader(http.StatusOK)
@@ -209,7 +213,6 @@ func main() {
 	})
 
 	log.Println("Booting Zero-Trust Ingress Edge Node on :443")
-	// Launch the unified Edge Node (which triggers the kernel Boot protocol and listeners)
 	if err := edgeNode.Start("443", r.TLSConfig); err != nil {
 		log.Fatalf("Edge Node crashed: %v", err)
 	}
