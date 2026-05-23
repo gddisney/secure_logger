@@ -113,10 +113,12 @@ func main() {
 	logPageID := ultimate_db.PageID(1)
 
 	r.GUIKit = ui
-	r.Mux.Handle("/", ui.Mux)
-
-	gatewayPubKey := []byte("central-gateway-static-pubkey-32b") 
-	gatewayAddress := "gateway.mesh.internal:443"
+	r.Mux.Handle("/index", ui.Mux)
+        keyTxn := db.BeginTxn()
+	gatewayPubKey, _ := db.Read(99, keyTxn, []byte("mesh_noise_pub"))
+	db.CommitTxn(keyTxn)
+        log.Printf("GATEWAY NOISE PUBKEY: %x", gatewayPubKey)
+	gatewayAddress := "localhost:443"
 
 	meshNode, err := secure_network.NewMeshNode(db, gatewayPubKey)
 	if err != nil { log.Fatalf("Mesh Node hardware identity instantiation failed: %v", err) }

@@ -2,19 +2,26 @@ package main
 
 import (
 	"bufio"
-	"crypto/rand"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"strings"
-
 	"github.com/gddisney/secure_network"
 	"github.com/gddisney/ultimate_db"
 )
 
-// LogPayload must match the gateway's expected ingestion format
+// SignedLogPayload enforces the attribution requirement.
+type SignedLogPayload struct {
+	Payload   LogPayload `json:"payload"`
+	SignerKey string     `json:"signer_key"`
+	Signature string     `json:"signature"`
+}
+
 type LogPayload struct {
 	Level   string `json:"level"`
 	Service string `json:"service"`
@@ -22,68 +29,77 @@ type LogPayload struct {
 }
 
 func main() {
-	// 1. Setup CLI flags
-	gatewayAddr := flag.String("gateway", "gateway.mesh.internal:443", "Gateway QUIC address")
+	gatewayAddr := flag.String("gateway", "localhost:9000", "Gateway QUIC address")
 	serviceName := flag.String("service", "slog-pipe", "Service name")
+	pubKeyHex := flag.String("pubkey", "", "Gateway Noise Public Key (hex)")
 	flag.Parse()
 
-	// 2. Initialize a local "headless" EdgeNode components
-	// We need a DB for identity storage, but we can use an in-memory disk manager
-	// or a temporary file since this is a transient logging client.
+	if *pubKeyHex == "" {
+		log.Fatal("? You must provide the gateway's 32-byte public key via -pubkey")
+	}
+
+	gatePub, err := hex.DecodeString(*pubKeyHex)
+	if err != nil || len(gatePub) != 32 {
+		log.Fatalf("? Invalid public key format: %v", err)
+	}
+
+	// 1. Initialize local identity storage (Transient or Persisted)
 	dm, _ := ultimate_db.NewDiskManager("client_identity.db")
 	bp := ultimate_db.NewBufferPool(dm, 64)
 	wal, _ := ultimate_db.NewBatchingWAL("client_identity.wal")
 	db := ultimate_db.NewDB(bp, wal)
 	defer db.Close()
 
-	// 3. Instantiate MeshNode (this handles the Noise Handshake + DBSC)
-	// You need to ensure the Gateway public key is known to the client
-	gatewayPubKey := []byte("central-gateway-static-pubkey-32b") 
-	meshNode, err := secure_network.NewMeshNode(db, gatewayPubKey)
+	// 2. Instantiate MeshNode (Handles Noise Handshake + Ed25519 Identity)
+	meshNode, err := secure_network.NewMeshNode(db, gatePub)
 	if err != nil {
 		log.Fatalf("Failed to init mesh node: %v", err)
 	}
 
-	// 4. Connect to the mesh gateway
-	fmt.Printf("📡 Establishing secure mesh tunnel to %s...\n", *gatewayAddr)
+	// 3. Connect to the mesh
+	fmt.Printf("?? Establishing secure mesh tunnel to %s...\n", *gatewayAddr)
 	if err := meshNode.Connect(*gatewayAddr); err != nil {
 		log.Fatalf("Mesh connection failed: %v", err)
 	}
-	fmt.Println("✅ Secure overlay connected.")
+	fmt.Println("? Secure overlay connected.")
 
-	// 5. Pipe loop
+	// 4. Pipe loop
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" { continue }
 
-		// Wrap the log in a payload
-		payload := LogPayload{
-			Level:   "INFO",
-			Service: *serviceName,
-			Message: line,
+		// Wrap and Sign Payload
+		payload := LogPayload{Level: "INFO", Service: *serviceName, Message: line}
+		payloadBytes, _ := json.Marshal(payload)
+		
+		// Sign with the node's Ed25519 identity key
+		// Assuming we retrieve the private key from our MeshNode's storage
+		// For implementation: replace with your actual DB retrieval logic
+		signature := ed25519.Sign(meshNode.GetDBSCPrivKey(), payloadBytes)
+		
+		signed := SignedLogPayload{
+			Payload:   payload,
+			SignerKey: hex.EncodeToString(meshNode.GetNoisePubKey()),
+			Signature: base64.StdEncoding.EncodeToString(signature),
 		}
 		
-		// Encode to JSON
-		payloadBytes, _ := json.Marshal(payload)
+		signedBytes, _ := json.Marshal(signed)
 
-		// 6. Send via Mesh RPC (Action: "rpc", Content: JSON RPC)
-		// This routes directly to your Gateway's routeToAPI() logic
+		// 5. Send via Mesh RPC (The PEP verifies the signature at the gateway)
 		rpcArgs := map[string]interface{}{
-			"method": "ingest_log",
-			"args":   payloadBytes,
+			"method": "ingest_signed_log",
+			"args":   signedBytes,
 		}
 		argsBytes, _ := json.Marshal(rpcArgs)
-		
+
 		err := meshNode.SendAction(secure_network.APIPayload{
 			Action:  "rpc",
 			Content: string(argsBytes),
 		})
 
 		if err != nil {
-			fmt.Printf("❌ Failed to send log: %v\n", err)
+			fmt.Printf("? Failed to send log: %v\n", err)
 		}
 	}
 }

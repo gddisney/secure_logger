@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/gddisney/guikit v1.0.5
-	github.com/gddisney/orchid_sync v1.0.1-0.20260521201054-813744692ab7
+	github.com/gddisney/orchid_sync v1.0.1
 	github.com/gddisney/secure_bootstrap v1.1.0
 	github.com/gddisney/secure_network v1.0.9
 	github.com/gddisney/ultimate_db v1.0.5
