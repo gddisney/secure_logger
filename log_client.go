@@ -2,17 +2,19 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"crypto/tls"
+	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
+	"log"
 	"os"
 	"strings"
-	"time"
+
+	"github.com/gddisney/secure_network"
+	"github.com/gddisney/ultimate_db"
 )
 
+// LogPayload must match the gateway's expected ingestion format
 type LogPayload struct {
 	Level   string `json:"level"`
 	Service string `json:"service"`
@@ -20,63 +22,68 @@ type LogPayload struct {
 }
 
 func main() {
-	targetURL := flag.String("url", "https://localhost:443/ingest", "The secure-logger ingest URL")
-	serviceName := flag.String("service", "slog-pipe", "The service name to tag these logs with")
+	// 1. Setup CLI flags
+	gatewayAddr := flag.String("gateway", "gateway.mesh.internal:443", "Gateway QUIC address")
+	serviceName := flag.String("service", "slog-pipe", "Service name")
 	flag.Parse()
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		Timeout: 5 * time.Second,
+	// 2. Initialize a local "headless" EdgeNode components
+	// We need a DB for identity storage, but we can use an in-memory disk manager
+	// or a temporary file since this is a transient logging client.
+	dm, _ := ultimate_db.NewDiskManager("client_identity.db")
+	bp := ultimate_db.NewBufferPool(dm, 64)
+	wal, _ := ultimate_db.NewBatchingWAL("client_identity.wal")
+	db := ultimate_db.NewDB(bp, wal)
+	defer db.Close()
+
+	// 3. Instantiate MeshNode (this handles the Noise Handshake + DBSC)
+	// You need to ensure the Gateway public key is known to the client
+	gatewayPubKey := []byte("central-gateway-static-pubkey-32b") 
+	meshNode, err := secure_network.NewMeshNode(db, gatewayPubKey)
+	if err != nil {
+		log.Fatalf("Failed to init mesh node: %v", err)
 	}
 
-	// Check if stdin is actually receiving piped data
-	stat, _ := os.Stdin.Stat()
-	if (stat.Mode() & os.ModeCharDevice) != 0 {
-		fmt.Println("⚠️  WARNING: No pipe detected. (Did you use the '|' operator?) Type manually and press Enter:")
-	} else {
-		fmt.Printf("📡 Connected to pipe. Forwarding to %s...\n", *targetURL)
+	// 4. Connect to the mesh gateway
+	fmt.Printf("📡 Establishing secure mesh tunnel to %s...\n", *gatewayAddr)
+	if err := meshNode.Connect(*gatewayAddr); err != nil {
+		log.Fatalf("Mesh connection failed: %v", err)
 	}
+	fmt.Println("✅ Secure overlay connected.")
 
+	// 5. Pipe loop
 	scanner := bufio.NewScanner(os.Stdin)
-
 	for scanner.Scan() {
 		line := scanner.Text()
-		fmt.Printf("\n[DEBUG-1] Read line from stdin: %s\n", line)
-
 		if strings.TrimSpace(line) == "" {
-			fmt.Println("[DEBUG-2] Line was empty, skipping.")
 			continue
 		}
 
+		// Wrap the log in a payload
 		payload := LogPayload{
 			Level:   "INFO",
 			Service: *serviceName,
 			Message: line,
 		}
-
-		jsonData, err := json.Marshal(payload)
-		if err != nil {
-			fmt.Printf("❌ [DEBUG-3] JSON Encode failed: %v\n", err)
-			continue
-		}
-		fmt.Printf("[DEBUG-3] Generated JSON Payload: %s\n", string(jsonData))
-
-		fmt.Println("[DEBUG-4] Firing HTTP POST to server...")
-		resp, err := client.Post(*targetURL, "application/json", bytes.NewBuffer(jsonData))
-		if err != nil {
-			fmt.Printf("❌ [DEBUG-5] NETWORK ERROR: %v\n", err)
-			continue
-		}
 		
-		fmt.Printf("[DEBUG-5] Server responded with Status: %d %s\n", resp.StatusCode, resp.Status)
-		resp.Body.Close()
-	}
+		// Encode to JSON
+		payloadBytes, _ := json.Marshal(payload)
 
-	if err := scanner.Err(); err != nil {
-		fmt.Printf("❌ Fatal scanner error: %v\n", err)
+		// 6. Send via Mesh RPC (Action: "rpc", Content: JSON RPC)
+		// This routes directly to your Gateway's routeToAPI() logic
+		rpcArgs := map[string]interface{}{
+			"method": "ingest_log",
+			"args":   payloadBytes,
+		}
+		argsBytes, _ := json.Marshal(rpcArgs)
+		
+		err := meshNode.SendAction(secure_network.APIPayload{
+			Action:  "rpc",
+			Content: string(argsBytes),
+		})
+
+		if err != nil {
+			fmt.Printf("❌ Failed to send log: %v\n", err)
+		}
 	}
-	
-	fmt.Println("[DEBUG-6] Scanner closed/EOF reached. Exiting.")
 }
